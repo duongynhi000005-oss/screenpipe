@@ -27,18 +27,22 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
     } else {
         None
     };
-    let pi: Arc<dyn AgentExecutor> = Arc::new(PiExecutor::new(user_token.clone()));
+    let local_api_key = crate::auth_key::find_api_auth_key_for_data_dir(&data_dir).await;
+    let pi: Arc<dyn AgentExecutor> = Arc::new(
+        PiExecutor::new(user_token.clone()).with_api_auth_key(local_api_key.clone()),
+    );
     let acp: Arc<dyn AgentExecutor> = Arc::new(AcpExecutor::new(
         user_token,
         SCREENPIPE_API_URL.to_string(),
         3030,
-        std::env::var("SCREENPIPE_LOCAL_API_KEY").ok(),
+        local_api_key.clone().or_else(|| std::env::var("SCREENPIPE_LOCAL_API_KEY").ok()),
     ));
     let mut executors: HashMap<String, Arc<dyn AgentExecutor>> = HashMap::new();
     executors.insert("pi".to_string(), pi);
     executors.insert("acp".to_string(), acp);
 
-    let manager = PipeManager::new(pipes_dir.clone(), executors, None, 3030);
+    let manager = PipeManager::new(pipes_dir.clone(), executors, None, 3030)
+        .with_local_api_key(local_api_key);
     manager.load_pipes().await?;
 
     match command {

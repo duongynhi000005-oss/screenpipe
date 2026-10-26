@@ -2905,6 +2905,7 @@ async fn setup_pipe_permissions(
     pipe_dir: &Path,
     config: &PipeConfig,
     token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
+    local_api_key: Option<&str>,
     read_only: bool,
     api_port: u16,
 ) -> Option<String> {
@@ -2951,17 +2952,31 @@ async fn setup_pipe_permissions(
     let force_write = perms.pipe_dir.is_some();
 
     if perms.has_any_restrictions() || force_write {
-        // Generate a unique pipe token for server-side enforcement
-        use rand::Rng;
-        let suffix: u64 = rand::rng().random();
-        let t = format!("sp_pipe_{:016x}", suffix);
-        perms.pipe_token = Some(t.clone());
+        // Generate or resolve a pipe token for enforcement
+        let token = if let Some(registry) = token_registry {
+            use rand::Rng;
+            let suffix: u64 = rand::rng().random();
+            let t = format!("sp_pipe_{:016x}", suffix);
+            perms.pipe_token = Some(t.clone());
 
-        // Register with server middleware — must complete before Pi starts
-        // to avoid race where Pi's first API call arrives before token is registered
-        if let Some(registry) = token_registry {
+            // Register with server middleware — must complete before Pi starts
+            // to avoid race where Pi's first API call arrives before token is registered
             registry.register_token(t.clone(), perms.clone()).await;
-        }
+            Some(t)
+        } else if let Some(key) = local_api_key {
+            // Standalone execution (e.g. CLI pipe run without in-process server):
+            // We cannot register an ephemeral sp_pipe_ token with the running server.
+            // Use the authoritative local API key if provided so requests to the
+            // local API are authorized.
+            perms.pipe_token = Some(key.to_string());
+            None
+        } else {
+            use rand::Rng;
+            let suffix: u64 = rand::rng().random();
+            let t = format!("sp_pipe_{:016x}", suffix);
+            perms.pipe_token = Some(t);
+            None
+        };
 
         // Write permissions JSON for the extension to read
         let perms_path = pipe_dir.join(".screenpipe-permissions.json");
@@ -2977,7 +2992,7 @@ async fn setup_pipe_permissions(
             Err(e) => warn!("failed to serialize permissions: {}", e),
         }
 
-        Some(t)
+        token
     } else {
         // No restrictions — clean up any stale permissions file
         let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-permissions.json"));
@@ -3242,6 +3257,12 @@ impl PipeManager {
             // SAFETY: called during single-threaded init before scheduler starts
             unsafe { std::env::set_var("SCREENPIPE_LOCAL_API_KEY", k) };
         }
+    }
+
+    /// Builder helper to attach the local API auth key.
+    pub fn with_local_api_key(mut self, key: Option<String>) -> Self {
+        self.set_local_api_key(key);
+        self
     }
 
     /// Set a token registry for server-side permission enforcement.
@@ -4384,6 +4405,7 @@ impl PipeManager {
                 &pipe_dir,
                 &config,
                 self.token_registry.as_ref(),
+                self.local_api_key.as_deref(),
                 trigger == "event" && event_runs_are_read_only(&config),
                 self.api_port,
             )
@@ -5085,6 +5107,7 @@ impl PipeManager {
                     &self.pipes_dir.join(name),
                     &config,
                     self.token_registry.as_ref(),
+                    self.local_api_key.as_deref(),
                     trigger == "event" && event_runs_are_read_only(&config),
                     self.api_port,
                 )
@@ -6916,6 +6939,7 @@ impl PipeManager {
                             &pipes_dir.join(name),
                             config,
                             token_registry.as_ref(),
+                            local_api_key.as_deref(),
                             triggered_by_event && event_runs_are_read_only(config),
                             api_port,
                         )
@@ -13743,6 +13767,88 @@ Run the scheduled task.
             !sys.contains("API Authentication: REQUIRED"),
             "auth note must not be emitted when local_api_key is None"
         );
+    }
+
+    struct TestRegistry {
+        registered: std::sync::Arc<tokio::sync::Mutex<HashMap<String, permissions::PipePermissions>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl permissions::PipeTokenRegistry for TestRegistry {
+        async fn register_token(&self, token: String, perms: permissions::PipePermissions) {
+            self.registered.lock().await.insert(token, perms);
+        }
+
+        async fn remove_token(&self, token: &str) {
+            self.registered.lock().await.remove(token);
+        }
+    }
+
+    fn test_pipe_config(name: &str) -> PipeConfig {
+        let (mut config, _) = parse_frontmatter("---\nschedule: every 1h\n---\n").unwrap();
+        config.name = name.to_string();
+        config
+    }
+
+    #[tokio::test]
+    async fn test_setup_pipe_permissions_standalone_uses_local_api_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_pipe_config("test-standalone-pipe");
+
+        let cleanup_token = setup_pipe_permissions(
+            dir.path(),
+            &config,
+            None,
+            Some("sp-local-test-key"),
+            false,
+            3030,
+        )
+        .await;
+
+        // In standalone mode with no server registry, no ephemeral token was registered for cleanup
+        assert_eq!(cleanup_token, None);
+
+        // Permissions JSON must contain the local API key so pipe subprocesses authenticate properly
+        let perms_file = dir.path().join(".screenpipe-permissions.json");
+        assert!(perms_file.exists());
+        let content = std::fs::read_to_string(&perms_file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["pipe_token"].as_str(), Some("sp-local-test-key"));
+        assert_eq!(value["api_base"].as_str(), Some("http://127.0.0.1:3030"));
+    }
+
+    #[tokio::test]
+    async fn test_setup_pipe_permissions_with_registry_registers_ephemeral_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_pipe_config("test-registered-pipe");
+
+        let registered = std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let registry: Arc<dyn permissions::PipeTokenRegistry> = Arc::new(TestRegistry {
+            registered: registered.clone(),
+        });
+
+        let cleanup_token = setup_pipe_permissions(
+            dir.path(),
+            &config,
+            Some(&registry),
+            Some("sp-local-test-key"),
+            false,
+            3030,
+        )
+        .await;
+
+        let token = cleanup_token.expect("expected registered token for cleanup");
+        assert!(token.starts_with("sp_pipe_"));
+
+        // Must be registered in the registry
+        let map = registered.lock().await;
+        assert!(map.contains_key(&token));
+
+        // Permissions JSON must contain the ephemeral token
+        let perms_file = dir.path().join(".screenpipe-permissions.json");
+        let content = std::fs::read_to_string(&perms_file).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["pipe_token"].as_str(), Some(token.as_str()));
     }
 
     #[test]
