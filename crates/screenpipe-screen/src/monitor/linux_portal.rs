@@ -48,6 +48,7 @@ const PORTAL_RUNNING: u8 = 2;
 const PORTAL_FAILED: u8 = 3;
 const PORTAL_RETRY_DELAY: Duration = Duration::from_secs(60);
 pub(super) const PORTAL_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(12);
+pub(super) const PORTAL_IDLE_DEBOUNCE: Duration = Duration::from_secs(30);
 
 static SHARED_PORTAL_CAPTURE: Lazy<Mutex<Weak<PortalCaptureSession>>> =
     Lazy::new(|| Mutex::new(Weak::new()));
@@ -106,6 +107,7 @@ struct PortalShared {
     monitors: Mutex<HashMap<u32, MonitorDescriptor>>,
     node_by_monitor: Mutex<HashMap<u32, u32>>,
     active_requests: Mutex<HashMap<u32, usize>>,
+    last_request_at: Mutex<HashMap<u32, Instant>>,
     frames: Mutex<HashMap<u32, PortalFrame>>,
     frame_ready: Condvar,
     control: Mutex<Option<ActiveControl>>,
@@ -123,6 +125,7 @@ impl Default for PortalShared {
             monitors: Mutex::new(HashMap::new()),
             node_by_monitor: Mutex::new(HashMap::new()),
             active_requests: Mutex::new(HashMap::new()),
+            last_request_at: Mutex::new(HashMap::new()),
             frames: Mutex::new(HashMap::new()),
             frame_ready: Condvar::new(),
             control: Mutex::new(None),
@@ -234,19 +237,29 @@ impl PortalCaptureSession {
             self.invalidate_current();
         }
 
-        *self
-            .shared
-            .active_requests
-            .lock()
-            .unwrap()
-            .entry(monitor_id)
-            .or_default() += 1;
+        let need_activate = {
+            let mut requests = self.shared.active_requests.lock().unwrap();
+            let mut last_req = self.shared.last_request_at.lock().unwrap();
+            last_req.insert(monitor_id, Instant::now());
+            match requests.entry(monitor_id) {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
+                    *occ.get_mut() += 1;
+                    false
+                }
+                std::collections::hash_map::Entry::Vacant(vac) => {
+                    vac.insert(1);
+                    true
+                }
+            }
+        };
 
         if let Err(error) = self.ensure_started() {
             self.end_capture(monitor_id);
             return Err(error);
         }
-        self.set_monitor_active(monitor_id, true);
+        if need_activate {
+            self.set_monitor_active(monitor_id, true);
+        }
 
         Ok(PortalCaptureRequest {
             session: Arc::downgrade(self),
@@ -316,6 +329,11 @@ impl PortalCaptureSession {
     pub(super) fn release_monitor(&self, monitor_id: u32) {
         self.shared
             .active_requests
+            .lock()
+            .unwrap()
+            .remove(&monitor_id);
+        self.shared
+            .last_request_at
             .lock()
             .unwrap()
             .remove(&monitor_id);
@@ -395,21 +413,60 @@ impl PortalCaptureSession {
     }
 
     fn end_capture(&self, monitor_id: u32) {
-        let should_pause = {
+        let should_debounce = {
             let mut requests = self.shared.active_requests.lock().unwrap();
+            let mut last_req = self.shared.last_request_at.lock().unwrap();
+            last_req.insert(monitor_id, Instant::now());
             let Some(count) = requests.get_mut(&monitor_id) else {
                 return;
             };
             *count = count.saturating_sub(1);
-            if *count == 0 {
-                requests.remove(&monitor_id);
-                true
-            } else {
-                false
-            }
+            *count == 0
         };
-        if should_pause {
-            self.set_monitor_active(monitor_id, false);
+
+        if should_debounce {
+            // Do NOT immediately deactivate the stream!
+            // Deactivating per-frame causes KDE Plasma's screencasting indicator to flash
+            // constantly on and off (see issue #7758).
+            // Instead, debounce deactivation: wait for complete capture inactivity.
+            let shared = self.shared.clone();
+            let generation = self.shared.generation.load(Ordering::Acquire);
+            tokio::spawn(async move {
+                tokio::time::sleep(PORTAL_IDLE_DEBOUNCE).await;
+                if shared.generation.load(Ordering::Acquire) != generation {
+                    return;
+                }
+                let should_deactivate = {
+                    let mut requests = shared.active_requests.lock().unwrap();
+                    let last_req = shared.last_request_at.lock().unwrap();
+                    if let (Some(&c), Some(&last_at)) = (requests.get(&monitor_id), last_req.get(&monitor_id)) {
+                        if c == 0 && last_at.elapsed() >= PORTAL_IDLE_DEBOUNCE {
+                            requests.remove(&monitor_id);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if should_deactivate {
+                    let node_id = shared
+                        .node_by_monitor
+                        .lock()
+                        .unwrap()
+                        .get(&monitor_id)
+                        .copied();
+                    let control = shared.control.lock().unwrap().clone();
+                    if let (Some(node_id), Some(control)) = (node_id, control) {
+                        if control.generation == shared.generation.load(Ordering::Acquire) {
+                            let _ = control
+                                .sender
+                                .send(PortalControl::SetActive { node_id, active: false });
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -438,6 +495,8 @@ impl PortalCaptureSession {
             let _ = control.sender.send(PortalControl::Shutdown);
         }
         self.shared.node_by_monitor.lock().unwrap().clear();
+        self.shared.active_requests.lock().unwrap().clear();
+        self.shared.last_request_at.lock().unwrap().clear();
         self.shared.frames.lock().unwrap().clear();
         self.shared.phase.store(PORTAL_IDLE, Ordering::Release);
         self.shared.frame_ready.notify_all();
@@ -1186,5 +1245,40 @@ mod tests {
 
         assert!(*shutdown_rx.borrow());
         assert_eq!(*generation_rx.borrow(), u64::MAX);
+    }
+
+    #[test]
+    fn debounced_capture_lifecycle_retains_monitor_in_active_window() {
+        let shared = Arc::new(PortalShared::default());
+        let (shutdown_tx, _) = watch::channel(false);
+        let (generation_tx, _) = watch::channel(0);
+        let session = Arc::new(PortalCaptureSession {
+            shared: shared.clone(),
+            shutdown_tx,
+            generation_tx,
+        });
+
+        // Initially no active requests or timestamps
+        assert!(!shared.active_requests.lock().unwrap().contains_key(&1));
+        assert!(!shared.last_request_at.lock().unwrap().contains_key(&1));
+
+        // When a capture request begins, active count is 1
+        {
+            let mut requests = shared.active_requests.lock().unwrap();
+            let mut last_req = shared.last_request_at.lock().unwrap();
+            last_req.insert(1, Instant::now());
+            requests.insert(1, 1);
+        }
+        assert_eq!(*shared.active_requests.lock().unwrap().get(&1).unwrap(), 1);
+
+        // When end_capture runs, count drops to 0 but monitor is NOT removed immediately (debouncing)
+        session.end_capture(1);
+        assert_eq!(*shared.active_requests.lock().unwrap().get(&1).unwrap(), 0);
+        assert!(shared.last_request_at.lock().unwrap().contains_key(&1));
+
+        // When release_monitor is called, monitor is immediately removed
+        session.release_monitor(1);
+        assert!(!shared.active_requests.lock().unwrap().contains_key(&1));
+        assert!(!shared.last_request_at.lock().unwrap().contains_key(&1));
     }
 }
