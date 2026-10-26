@@ -607,11 +607,14 @@ impl DatabaseManager {
         let query = format!(
             r#"{}
                 {}
-                AND at.timestamp IN (
-                    SELECT timestamp
+                AND at.id IN (
+                    SELECT at2.id
                     FROM audio_transcriptions at2
+                    JOIN audio_chunks ac2 ON at2.audio_chunk_id = ac2.id
                     WHERE at2.speaker_id = s.id
-                    ORDER BY timestamp DESC
+                      AND ac2.file_path NOT LIKE 'cloud://%'
+                      AND TRIM(COALESCE(ac2.file_path, '')) NOT IN ('', '.')
+                    ORDER BY at2.timestamp DESC, at2.id DESC
                     LIMIT 3
                 )
             )
@@ -725,18 +728,19 @@ impl DatabaseManager {
             .await;
         }
 
-        // Group by name so duplicate names (e.g. multiple "Louis" rows from
-        // separate voice embeddings) appear as a single entry in the dropdown.
-        // Pick the lowest id per name so reassignment targets a stable speaker.
-        // Include recent audio samples so the UI can display voice clips.
+        // Return each named speaker row with only its own recent audio samples
+        // so Settings -> Speakers cards always match the speaker ID they mutate
+        // on rename, hallucination removal, or delete.
         sqlx::query_as::<_, Speaker>(
             r#"
             WITH NamedSpeakers AS (
-                SELECT MIN(id) as id, name
+                SELECT id, name
                 FROM speakers
-                WHERE name LIKE ? || '%' AND hallucination = 0 AND name IS NOT NULL AND name != ''
-                GROUP BY name
-                ORDER BY name COLLATE NOCASE
+                WHERE name LIKE ? || '%' COLLATE NOCASE
+                  AND hallucination = 0
+                  AND name IS NOT NULL
+                  AND name != ''
+                ORDER BY name COLLATE NOCASE, id ASC
                 LIMIT ? OFFSET ?
             ),
             RecentAudioPaths AS (
@@ -749,18 +753,18 @@ impl DatabaseManager {
                     at2.end_time,
                     CAST(unixepoch(at2.timestamp) AS INTEGER) as abs_timestamp
                 FROM NamedSpeakers ns
-                JOIN audio_transcriptions at2 ON at2.speaker_id IN (
-                    SELECT s2.id FROM speakers s2 WHERE s2.name = ns.name AND s2.hallucination = 0
-                )
+                JOIN audio_transcriptions at2 ON at2.speaker_id = ns.id
                 JOIN audio_chunks ac ON at2.audio_chunk_id = ac.id
                 WHERE ac.file_path NOT LIKE 'cloud://%'
                 AND TRIM(COALESCE(ac.file_path, '')) NOT IN ('', '.')
-                AND at2.timestamp IN (
-                    SELECT at3.timestamp
+                AND at2.id IN (
+                    SELECT at3.id
                     FROM audio_transcriptions at3
-                    JOIN speakers s3 ON at3.speaker_id = s3.id
-                    WHERE s3.name = ns.name AND s3.hallucination = 0
-                    ORDER BY at3.timestamp DESC
+                    JOIN audio_chunks ac3 ON at3.audio_chunk_id = ac3.id
+                    WHERE at3.speaker_id = ns.id
+                      AND ac3.file_path NOT LIKE 'cloud://%'
+                      AND TRIM(COALESCE(ac3.file_path, '')) NOT IN ('', '.')
+                    ORDER BY at3.timestamp DESC, at3.id DESC
                     LIMIT 3
                 )
             )
@@ -784,7 +788,7 @@ impl DatabaseManager {
             JOIN speakers s ON s.id = ns.id
             LEFT JOIN RecentAudioPaths rap ON ns.id = rap.speaker_id
             GROUP BY ns.id, ns.name
-            ORDER BY ns.name
+            ORDER BY ns.name COLLATE NOCASE, ns.id ASC
             "#,
         )
         .bind(name_prefix)
@@ -878,11 +882,14 @@ impl DatabaseManager {
                 AND s.hallucination = 0
                 AND ac.file_path NOT LIKE 'cloud://%'
                 AND TRIM(COALESCE(ac.file_path, '')) NOT IN ('', '.')
-                AND at.timestamp IN (
-                    SELECT timestamp
+                AND at.id IN (
+                    SELECT at2.id
                     FROM audio_transcriptions at2
+                    JOIN audio_chunks ac2 ON at2.audio_chunk_id = ac2.id
                     WHERE at2.speaker_id = s.id
-                    ORDER BY timestamp DESC
+                      AND ac2.file_path NOT LIKE 'cloud://%'
+                      AND TRIM(COALESCE(ac2.file_path, '')) NOT IN ('', '.')
+                    ORDER BY at2.timestamp DESC, at2.id DESC
                     LIMIT 3
                 )
             ),
@@ -922,6 +929,43 @@ impl DatabaseManager {
             GROUP BY s.id
             ORDER BY vec_distance_cosine(se.embedding, (SELECT embedding FROM speaker_embedding))
             LIMIT ?3"#,
+        )
+        .bind(speaker_id)
+        .bind(threshold)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Find named speakers with a voice similar to `speaker_id`.
+    /// Filters to named, non-hallucination speakers in SQL before applying `LIMIT`
+    /// so unnamed speaker clusters do not crowd out named duplicates during
+    /// alias deduplication.
+    pub async fn get_similar_named_speakers(
+        &self,
+        speaker_id: i64,
+        limit: u32,
+    ) -> Result<Vec<Speaker>, sqlx::Error> {
+        let threshold = 0.8;
+
+        sqlx::query_as::<sqlx::Sqlite, Speaker>(
+            r#"
+            SELECT
+                s.id,
+                s.name,
+                COALESCE(s.metadata, '{}') as metadata
+            FROM speaker_embeddings se
+            JOIN speaker_embeddings se_source ON se_source.speaker_id = ?1
+            JOIN speakers s ON se.speaker_id = s.id
+            WHERE se.speaker_id != ?1
+              AND COALESCE(s.hallucination, 0) = 0
+              AND s.name IS NOT NULL
+              AND TRIM(s.name) != ''
+            GROUP BY s.id, s.name, s.metadata
+            HAVING MIN(vec_distance_cosine(se.embedding, se_source.embedding)) < ?2
+            ORDER BY MIN(vec_distance_cosine(se.embedding, se_source.embedding)) ASC, s.id ASC
+            LIMIT ?3
+            "#,
         )
         .bind(speaker_id)
         .bind(threshold)

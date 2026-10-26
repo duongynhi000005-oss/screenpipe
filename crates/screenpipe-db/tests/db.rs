@@ -1956,6 +1956,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_speakers_duplicate_names_preserve_card_identity_and_samples() {
+        let db = setup_test_db().await;
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+
+        let speaker_1 = db.insert_speaker(&vec![0.1; 512]).await.unwrap();
+        db.update_speaker_name(speaker_1.id, "John").await.unwrap();
+        let chunk_1 = db.insert_audio_chunk("john_1.mp4", None).await.unwrap();
+        db.insert_audio_transcription(
+            chunk_1,
+            "john one voice sample",
+            0,
+            "",
+            &device,
+            Some(speaker_1.id),
+            Some(0.0),
+            Some(2.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let speaker_2 = db.insert_speaker(&vec![0.9; 512]).await.unwrap();
+        db.update_speaker_name(speaker_2.id, "John").await.unwrap();
+        let chunk_2 = db.insert_audio_chunk("john_2.mp4", None).await.unwrap();
+        db.insert_audio_transcription(
+            chunk_2,
+            "john two voice sample",
+            0,
+            "",
+            &device,
+            Some(speaker_2.id),
+            Some(2.0),
+            Some(4.0),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Picker mode (include_samples = false) still deduplicates names for dropdown autocomplete
+        let picker_speakers = db
+            .search_speakers_limited("John", 10, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(picker_speakers.len(), 1);
+
+        // Management mode (include_samples = true) returns each speaker row with its own samples
+        let cards = db
+            .search_speakers_limited("John", 10, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].id, speaker_1.id);
+        assert!(cards[0].metadata.contains("john one voice sample"));
+        assert!(!cards[0].metadata.contains("john two voice sample"));
+
+        assert_eq!(cards[1].id, speaker_2.id);
+        assert!(cards[1].metadata.contains("john two voice sample"));
+        assert!(!cards[1].metadata.contains("john one voice sample"));
+
+        // Renaming speaker_2 mutates only speaker_2 and leaves speaker_1's samples intact
+        db.update_speaker_name(speaker_2.id, "John Smith")
+            .await
+            .unwrap();
+        let updated = db
+            .search_speakers_limited("John", 10, 0, true)
+            .await
+            .unwrap();
+        assert_eq!(updated.len(), 2);
+        let card_1 = updated.iter().find(|s| s.id == speaker_1.id).unwrap();
+        let card_2 = updated.iter().find(|s| s.id == speaker_2.id).unwrap();
+        assert_eq!(card_1.name, "John");
+        assert!(card_1.metadata.contains("john one voice sample"));
+        assert_eq!(card_2.name, "John Smith");
+        assert!(card_2.metadata.contains("john two voice sample"));
+    }
+
+    #[tokio::test]
+    async fn test_speaker_audio_samples_capped_at_three_when_chunk_shares_timestamp() {
+        let db = setup_test_db().await;
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+
+        let unnamed = db.insert_speaker(&vec![0.1; 512]).await.unwrap();
+        let chunk_id = db
+            .insert_audio_chunk("shared_chunk.mp4", None)
+            .await
+            .unwrap();
+
+        // Insert 6 segments on the same audio chunk (identical timestamp)
+        for i in 0..6 {
+            db.insert_audio_transcription(
+                chunk_id,
+                &format!("segment {i}"),
+                i,
+                "",
+                &device,
+                Some(unnamed.id),
+                Some(i as f64),
+                Some((i + 1) as f64),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let unnamed_list = db
+            .get_unnamed_speakers(10, 0, Some(vec![unnamed.id]))
+            .await
+            .unwrap();
+        assert_eq!(unnamed_list.len(), 1);
+        let unnamed_meta: serde_json::Value =
+            serde_json::from_str(&unnamed_list[0].metadata).unwrap();
+        assert_eq!(
+            unnamed_meta["audio_samples"].as_array().unwrap().len(),
+            3,
+            "get_unnamed_speakers must cap samples at 3 even when segments share a chunk timestamp"
+        );
+
+        db.update_speaker_name(unnamed.id, "MultiSegmentSpeaker")
+            .await
+            .unwrap();
+        let named_list = db.search_speakers("MultiSegmentSpeaker").await.unwrap();
+        assert_eq!(named_list.len(), 1);
+        let named_meta: serde_json::Value = serde_json::from_str(&named_list[0].metadata).unwrap();
+        assert_eq!(
+            named_meta["audio_samples"].as_array().unwrap().len(),
+            3,
+            "search_speakers must cap samples at 3 even when segments share a chunk timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_similar_named_speakers_not_crowded_out_by_unnamed_clusters() {
+        let db = setup_test_db().await;
+        let voice = vec![0.1; 512];
+
+        let target = db.insert_speaker(&voice).await.unwrap();
+        db.update_speaker_name(target.id, "Louis").await.unwrap();
+
+        for _ in 0..12 {
+            db.insert_speaker(&voice).await.unwrap();
+        }
+
+        let alias = db.insert_speaker(&voice).await.unwrap();
+        db.update_speaker_name(alias.id, "louis+teams1234@screenpi.pe")
+            .await
+            .unwrap();
+
+        let similar_named = db.get_similar_named_speakers(alias.id, 10).await.unwrap();
+        assert_eq!(similar_named.len(), 1);
+        assert_eq!(similar_named[0].id, target.id);
+        assert_eq!(similar_named[0].name, "Louis");
+    }
+
+    #[tokio::test]
     async fn test_delete_speaker() {
         let db = setup_test_db().await;
 

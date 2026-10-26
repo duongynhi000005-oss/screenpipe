@@ -382,11 +382,12 @@ async fn deduplicate_speaker_by_name(
     newly_named_id: i64,
     name: &str,
 ) {
-    // Get voice-similar speakers first — this is the strong signal
-    let similar = match db.get_similar_speakers(newly_named_id, 10).await {
+    // Query voice-similar named speakers directly in SQL so unnamed clusters
+    // cannot crowd out the LIMIT window.
+    let similar = match db.get_similar_named_speakers(newly_named_id, 10).await {
         Ok(v) => v,
         Err(e) => {
-            debug!("speaker dedup: get_similar_speakers failed: {}", e);
+            debug!("speaker dedup: get_similar_named_speakers failed: {}", e);
             return;
         }
     };
@@ -449,11 +450,11 @@ async fn deduplicate_existing_speaker_aliases(db: &screenpipe_db::DatabaseManage
             continue;
         }
 
-        let similar = match db.get_similar_speakers(speaker_id, 10).await {
+        let similar = match db.get_similar_named_speakers(speaker_id, 10).await {
             Ok(similar) => similar,
             Err(e) => {
                 debug!(
-                    "speaker alias cleanup: failed to get similar speakers for {}: {}",
+                    "speaker alias cleanup: failed to get similar named speakers for {}: {}",
                     speaker_id, e
                 );
                 continue;
@@ -1393,5 +1394,34 @@ mod tests {
         // Cleanup: delete the temporary speakers
         let _ = db.delete_speaker(id_a).await;
         let _ = db.delete_speaker(id_b).await;
+    }
+
+    #[tokio::test]
+    async fn test_dedup_not_crowded_out_by_unnamed_similar_speakers() {
+        let db = setup_db().await;
+        let embedding: Vec<f32> = vec![0.1; 512];
+
+        // Seed 12 unnamed speakers with the exact same voice so an unfiltered
+        // top-10 similarity query would return only unnamed rows.
+        for _ in 0..12 {
+            seed_speaker(&db, &embedding, None).await;
+        }
+
+        seed_speaker(&db, &embedding, Some("Louis")).await;
+        let id_b = seed_speaker(&db, &embedding, Some("louis+teams1234@screenpi.pe")).await;
+
+        deduplicate_existing_speaker_aliases(&db).await;
+
+        let plus = db
+            .find_speaker_by_name("louis+teams1234@screenpi.pe")
+            .await
+            .unwrap();
+        assert!(
+            plus.is_none(),
+            "named alias duplicate should be merged even when >10 unnamed similar speakers exist"
+        );
+        let louis = db.find_speaker_by_name("Louis").await.unwrap();
+        assert!(louis.is_some(), "canonical named speaker should remain");
+        let _ = id_b;
     }
 }
