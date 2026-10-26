@@ -2119,6 +2119,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_similar_speakers_uses_all_stored_embeddings_and_tight_threshold() {
+        let db = setup_test_db().await;
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+
+        let mut e1 = vec![0.0f32; 512];
+        e1[0] = 1.0;
+        let mut e2 = vec![0.0f32; 512];
+        e2[1] = 1.0;
+
+        // Speaker 1 has e1 first, then e2 added later
+        let s1 = db.insert_speaker(&e1).await.unwrap();
+        db.add_embedding_to_speaker(s1.id, &e2, 10).await.unwrap();
+        let c1 = db.insert_audio_chunk("s1.mp4", None).await.unwrap();
+        db.insert_audio_transcription(c1, "s1", 0, "", &device, Some(s1.id), None, None, None)
+            .await
+            .unwrap();
+
+        // Speaker 2 matches s1's second embedding (e2), orthogonal to s1's first embedding (e1)
+        let s2 = db.insert_speaker(&e2).await.unwrap();
+        let c2 = db.insert_audio_chunk("s2.mp4", None).await.unwrap();
+        db.insert_audio_transcription(c2, "s2", 0, "", &device, Some(s2.id), None, None, None)
+            .await
+            .unwrap();
+
+        // Speaker 3 has cosine similarity 0.30 (distance 0.70, between 0.55 and 0.80)
+        let mut e3 = vec![0.0f32; 512];
+        e3[0] = 0.30;
+        e3[2] = (1.0f32 - 0.30 * 0.30).sqrt();
+        let s3 = db.insert_speaker(&e3).await.unwrap();
+        let c3 = db.insert_audio_chunk("s3.mp4", None).await.unwrap();
+        db.insert_audio_transcription(c3, "s3", 0, "", &device, Some(s3.id), None, None, None)
+            .await
+            .unwrap();
+
+        let similar = db.get_similar_speakers(s1.id, 10).await.unwrap();
+        assert_eq!(similar.len(), 1);
+        assert_eq!(similar[0].id, s2.id);
+    }
+
+    #[tokio::test]
+    async fn test_merge_speakers_caps_stored_embeddings_and_recomputes_centroid() {
+        let db = setup_test_db().await;
+
+        let mut base1 = vec![0.0f32; 512];
+        base1[0] = 1.0;
+        let s1 = db.insert_speaker(&base1).await.unwrap();
+        db.update_speaker_name(s1.id, "Alice").await.unwrap();
+        for i in 1..8 {
+            let mut emb = vec![0.0f32; 512];
+            emb[0] = 1.0;
+            emb[i] = 0.1 * (i as f32);
+            db.add_embedding_to_speaker(s1.id, &emb, 10).await.unwrap();
+        }
+
+        let mut base2 = vec![0.0f32; 512];
+        base2[1] = 1.0;
+        let s2 = db.insert_speaker(&base2).await.unwrap();
+        for i in 8..15 {
+            let mut emb = vec![0.0f32; 512];
+            emb[1] = 1.0;
+            emb[i] = 0.1 * (i as f32);
+            db.add_embedding_to_speaker(s2.id, &emb, 10).await.unwrap();
+        }
+
+        assert_eq!(db.count_embeddings_for_speaker(s1.id).await.unwrap(), 8);
+        assert_eq!(db.count_embeddings_for_speaker(s2.id).await.unwrap(), 8);
+
+        db.merge_speakers(s1.id, s2.id).await.unwrap();
+
+        let merged_count = db.count_embeddings_for_speaker(s1.id).await.unwrap();
+        assert_eq!(
+            merged_count, 10,
+            "merged speaker embeddings must be capped at 10"
+        );
+
+        let centroids = db.get_named_speakers_with_centroids().await.unwrap();
+        let (_, _, centroid) = centroids
+            .into_iter()
+            .find(|(id, _, _)| *id == s1.id)
+            .unwrap();
+        assert!(
+            centroid[1] > 0.0,
+            "merged speaker centroid must be recomputed to include merged embeddings"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_match_speaker_from_embedding_excludes_hallucinations_and_collapses_duplicate_names(
+    ) {
+        let db = setup_test_db().await;
+
+        let voice = vec![0.2f32; 512];
+        let hallucinated = db.insert_speaker(&voice).await.unwrap();
+        db.update_speaker_name(hallucinated.id, "Hallucinated")
+            .await
+            .unwrap();
+        db.mark_speaker_as_hallucination(hallucinated.id)
+            .await
+            .unwrap();
+
+        let matched = db.match_speaker_from_embedding(&voice).await.unwrap();
+        assert!(
+            matches!(matched, screenpipe_db::SpeakerEmbeddingMatch::NoMatch),
+            "hallucinated speaker must not match in stored embeddings or centroid fallback"
+        );
+
+        // Two distinct rows with the same name ("John") and identical embeddings
+        // should collapse to Matched("John") rather than Ambiguous
+        let john_1 = db.insert_speaker(&voice).await.unwrap();
+        db.update_speaker_name(john_1.id, "John").await.unwrap();
+        let john_2 = db.insert_speaker(&voice).await.unwrap();
+        db.update_speaker_name(john_2.id, "John").await.unwrap();
+
+        let matched_john = db.match_speaker_from_embedding(&voice).await.unwrap();
+        match matched_john {
+            screenpipe_db::SpeakerEmbeddingMatch::Matched(speaker) => {
+                assert_eq!(speaker.name, "John");
+            }
+            other => panic!("expected Matched(John), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn test_search_with_frame_name() {
         let db = setup_test_db().await;
 

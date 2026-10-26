@@ -26,19 +26,142 @@ const SPEAKER_REF_TABLES: [&str; 5] = [
 /// embedding close to two profiles does not arbitrarily mutate either one.
 const SPEAKER_MATCH_MAX_DISTANCE: f32 = 0.55;
 const SPEAKER_MATCH_MIN_MARGIN: f32 = 0.08;
+const MAX_STORED_EMBEDDINGS_PER_SPEAKER: usize = 10;
 
 type SpeakerMatchCandidate = (i64, String, String, f32);
 
+fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom <= f32::EPSILON {
+        1.0
+    } else {
+        (1.0 - (dot / denom)).max(0.0)
+    }
+}
+
+fn compute_centroid_f32(embeddings: &[(i64, Vec<f32>)]) -> Vec<f32> {
+    let n = embeddings.len() as f32;
+    let mut sum = vec![0.0f32; 512];
+    for (_, emb) in embeddings {
+        for (s, &v) in sum.iter_mut().zip(emb.iter()) {
+            *s += v;
+        }
+    }
+    for s in &mut sum {
+        *s /= n;
+    }
+    sum
+}
+
+/// Cap a speaker's stored embeddings at `MAX_STORED_EMBEDDINGS_PER_SPEAKER` by
+/// pruning the most redundant (closest-to-centroid) embeddings, and recompute
+/// `speakers.centroid` and `speakers.embedding_count`.
+async fn recompute_and_cap_speaker_embeddings(
+    conn: &mut sqlx::SqliteConnection,
+    speaker_id: i64,
+) -> Result<(), SqlxError> {
+    let rows: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, embedding FROM speaker_embeddings WHERE speaker_id = ?1 ORDER BY id ASC",
+    )
+    .bind(speaker_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    let mut embeddings: Vec<(i64, Vec<f32>)> = rows
+        .into_iter()
+        .filter_map(|(id, blob)| {
+            if blob.len() == 512 * 4 {
+                let floats: Vec<f32> = blob
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                Some((id, floats))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+
+    let total_merged_count = embeddings.len() as i64;
+    let mut centroid = compute_centroid_f32(&embeddings);
+
+    while embeddings.len() > MAX_STORED_EMBEDDINGS_PER_SPEAKER {
+        let redundant_idx = embeddings
+            .iter()
+            .enumerate()
+            .min_by(|(_, (_, a)), (_, (_, b))| {
+                cosine_distance_f32(a, &centroid)
+                    .partial_cmp(&cosine_distance_f32(b, &centroid))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        let (redundant_id, _) = embeddings.remove(redundant_idx);
+        sqlx::query("DELETE FROM speaker_embeddings WHERE id = ?1")
+            .bind(redundant_id)
+            .execute(&mut *conn)
+            .await?;
+        centroid = compute_centroid_f32(&embeddings);
+    }
+
+    let current_count: i64 =
+        sqlx::query_scalar("SELECT COALESCE(embedding_count, 0) FROM speakers WHERE id = ?1")
+            .bind(speaker_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .unwrap_or(0);
+
+    let new_count = current_count.max(total_merged_count);
+    let centroid_bytes: &[u8] = centroid.as_bytes();
+    sqlx::query("UPDATE speakers SET centroid = vec_f32(?1), embedding_count = ?2 WHERE id = ?3")
+        .bind(centroid_bytes)
+        .bind(new_count)
+        .bind(speaker_id)
+        .execute(&mut *conn)
+        .await?;
+
+    Ok(())
+}
+
 fn classify_speaker_candidates(candidates: Vec<SpeakerMatchCandidate>) -> SpeakerEmbeddingMatch {
-    let Some((id, name, metadata, best_distance)) = candidates.first().cloned() else {
+    // Collapse duplicate speaker rows that share the same non-empty name so two
+    // unmerged profiles for the same person do not trigger false Ambiguous
+    // abstentions against each other.
+    let mut deduped: Vec<SpeakerMatchCandidate> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let trimmed = candidate.1.trim();
+        if !trimmed.is_empty()
+            && deduped
+                .iter()
+                .any(|existing| existing.1.trim().eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        deduped.push(candidate);
+    }
+
+    let Some((id, name, metadata, best_distance)) = deduped.first().cloned() else {
         return SpeakerEmbeddingMatch::NoMatch;
     };
     if best_distance >= SPEAKER_MATCH_MAX_DISTANCE {
         return SpeakerEmbeddingMatch::NoMatch;
-    }
+    };
     let best = Speaker { id, name, metadata };
 
-    if let Some((_, _, _, runner_up_distance)) = candidates.get(1) {
+    if let Some((_, _, _, runner_up_distance)) = deduped.get(1) {
         if runner_up_distance - best_distance < SPEAKER_MATCH_MIN_MARGIN {
             return SpeakerEmbeddingMatch::Ambiguous {
                 best,
@@ -72,6 +195,7 @@ async fn repoint_speaker_refs(
             transcriptions_moved = moved;
         }
     }
+    recompute_and_cap_speaker_embeddings(conn, to_speaker).await?;
     Ok(transcriptions_moved)
 }
 
@@ -205,19 +329,20 @@ impl DatabaseManager {
 
         // Use the best stored sample per distinct speaker. Without grouping, a
         // speaker's ten stored embeddings can occupy both result slots and hide
-        // a genuinely close runner-up profile.
+        // a genuinely close runner-up profile. Exclude hallucination speakers.
         let candidates: Vec<SpeakerMatchCandidate> = sqlx::query_as(
             "WITH candidates AS (
                  SELECT s.id, s.name, s.metadata,
                         MIN(vec_distance_cosine(se.embedding, vec_f32(?1))) AS distance
                  FROM speaker_embeddings se
                  JOIN speakers s ON s.id = se.speaker_id
+                 WHERE COALESCE(s.hallucination, 0) = 0
                  GROUP BY s.id, s.name, s.metadata
              )
              SELECT id, name, metadata, distance
              FROM candidates
              ORDER BY distance, id
-             LIMIT 2",
+             LIMIT 10",
         )
         .bind(bytes)
         .fetch_all(&self.pool)
@@ -234,8 +359,9 @@ impl DatabaseManager {
                     vec_distance_cosine(centroid, vec_f32(?1)) AS distance
              FROM speakers
              WHERE centroid IS NOT NULL
+               AND COALESCE(hallucination, 0) = 0
              ORDER BY distance, id
-             LIMIT 2",
+             LIMIT 10",
         )
         .bind(bytes)
         .fetch_all(&self.pool)
@@ -859,7 +985,7 @@ impl DatabaseManager {
         speaker_id: i64,
         limit: u32,
     ) -> Result<Vec<Speaker>, sqlx::Error> {
-        let threshold = 0.8;
+        let threshold = SPEAKER_MATCH_MAX_DISTANCE;
 
         sqlx::query_as::<sqlx::Sqlite, Speaker>(
             r#"
@@ -878,16 +1004,16 @@ impl DatabaseManager {
                 AND s.hallucination = 0
                 AND ac.file_path NOT LIKE 'cloud://%'
                 AND TRIM(COALESCE(ac.file_path, '')) NOT IN ('', '.')
-                AND at.timestamp IN (
-                    SELECT timestamp
+                AND at.id IN (
+                    SELECT at2.id
                     FROM audio_transcriptions at2
+                    JOIN audio_chunks ac2 ON at2.audio_chunk_id = ac2.id
                     WHERE at2.speaker_id = s.id
-                    ORDER BY timestamp DESC
+                      AND ac2.file_path NOT LIKE 'cloud://%'
+                      AND TRIM(COALESCE(ac2.file_path, '')) NOT IN ('', '.')
+                    ORDER BY at2.timestamp DESC, at2.id DESC
                     LIMIT 3
                 )
-            ),
-            speaker_embedding AS (
-                SELECT embedding FROM speaker_embeddings WHERE speaker_id = ?1
             )
             SELECT
                 s.id,
@@ -915,12 +1041,14 @@ impl DatabaseManager {
                     )
                 END as metadata
             FROM speaker_embeddings se
+            JOIN speaker_embeddings se_source ON se_source.speaker_id = ?1
             JOIN speakers s ON se.speaker_id = s.id
             JOIN RecentAudioPaths rap ON s.id = rap.speaker_id
-            WHERE vec_distance_cosine(se.embedding, (SELECT embedding FROM speaker_embedding)) < ?2
-            AND se.speaker_id != ?1
+            WHERE se.speaker_id != ?1
+              AND COALESCE(s.hallucination, 0) = 0
             GROUP BY s.id
-            ORDER BY vec_distance_cosine(se.embedding, (SELECT embedding FROM speaker_embedding))
+            HAVING MIN(vec_distance_cosine(se.embedding, se_source.embedding)) < ?2
+            ORDER BY MIN(vec_distance_cosine(se.embedding, se_source.embedding)) ASC, s.id ASC
             LIMIT ?3"#,
         )
         .bind(speaker_id)
