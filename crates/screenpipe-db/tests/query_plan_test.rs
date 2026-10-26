@@ -1085,4 +1085,25 @@ mod query_plan_tests {
         assert_uses_index(&plan, "audio_dedup");
         assert_no_table_scan(&plan, "audio_dedup");
     }
+
+    #[tokio::test]
+    async fn test_audio_chunk_file_path_lookup_uses_index() {
+        let db = setup_test_db().await;
+
+        for i in 0..50 {
+            db.insert_audio_chunk(&format!("/tmp/audio_chunk_{i}.mp4"), None)
+                .await
+                .unwrap();
+        }
+
+        // Verbatim hot-path query from DatabaseManager::get_audio_chunk_id / find_audio_chunk_id
+        let plan = explain(
+            &db,
+            "SELECT id FROM audio_chunks WHERE file_path = '/tmp/audio_chunk_25.mp4'",
+        )
+        .await;
+
+        assert_uses_index(&plan, "audio_chunk_file_path_lookup");
+        assert_no_table_scan(&plan, "audio_chunk_file_path_lookup");
+    }
 }

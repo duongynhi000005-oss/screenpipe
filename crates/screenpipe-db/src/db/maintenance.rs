@@ -1607,6 +1607,24 @@ impl DatabaseManager {
         });
     }
 
+    /// Maximum database file size (512 MiB) for an unconditional background
+    /// `PRAGMA quick_check(1)` on every startup.
+    ///
+    /// Above this size, scanning every B-tree and FTS page in a single read
+    /// transaction can hold a WAL snapshot open for 20–60+ minutes on multi-GB
+    /// databases, saturating disk read I/O and pinning `PRAGMA wal_checkpoint(PASSIVE)`.
+    /// Startup already validates the 100-byte SQLite header via
+    /// `preflight_existing_database_header` and runs offline `quick_check(1)` in
+    /// `verify_database_before_reopen` whenever a fault or quarantine marker is set.
+    pub(crate) const MAX_STARTUP_QUICK_CHECK_BYTES: u64 = 512 * 1024 * 1024;
+
+    pub(crate) fn should_run_startup_quick_check(database_path: &std::path::Path) -> bool {
+        match std::fs::metadata(database_path) {
+            Ok(meta) => meta.len() <= Self::MAX_STARTUP_QUICK_CHECK_BYTES,
+            Err(_) => true,
+        }
+    }
+
     /// Spawn a one-shot background `PRAGMA quick_check` shortly after startup.
     ///
     /// Corruption ("database disk image is malformed", SQLITE_CORRUPT)
@@ -1626,9 +1644,22 @@ impl DatabaseManager {
     }
 
     pub(crate) fn spawn_startup_integrity_check(&self, database_path: Arc<str>) {
+        let db_file = std::path::Path::new(&*database_path);
+        if !Self::should_run_startup_quick_check(db_file) {
+            let size_mb = std::fs::metadata(db_file)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
+            info!(
+                db = %database_path,
+                size_mb,
+                max_mb = Self::MAX_STARTUP_QUICK_CHECK_BYTES / (1024 * 1024),
+                "skipping unconditional startup quick_check on large database to avoid long read snapshot and WAL checkpoint pinning"
+            );
+            return;
+        }
         let pool = self.startup_integrity_pool();
         let persistent_failure_hook = self.persistent_failure_hook.clone();
-        crate::recovery::register_database_pool(std::path::Path::new(&*database_path), &pool);
+        crate::recovery::register_database_pool(db_file, &pool);
         let timeout = Duration::from_secs(self.storage.as_ref().map_or_else(
             || crate::storage::StorageBudget::default().lifecycle_timeout_secs,
             |storage| storage.descriptor.budget.lifecycle_timeout_secs,
@@ -1641,6 +1672,10 @@ impl DatabaseManager {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(10)) => {},
                 _ = shutdown.cancelled() => { pool.close().await; return; }
+            }
+            if !Self::should_run_startup_quick_check(std::path::Path::new(&*database_path)) {
+                pool.close().await;
+                return;
             }
             // quick_check(1) stops after the first error — we only need a
             // yes/no signal here, not the full corruption inventory.
@@ -2082,6 +2117,25 @@ mod wal_maintenance_tests {
         assert_eq!(query_only, 1);
         fresh.close().await;
         db.close().await;
+    }
+
+    #[tokio::test]
+    async fn startup_quick_check_skips_databases_above_size_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("db.sqlite");
+        let file = std::fs::File::create(&db_path).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        assert!(
+            DatabaseManager::should_run_startup_quick_check(&db_path),
+            "databases within the startup quick_check budget should be eligible"
+        );
+
+        file.set_len(DatabaseManager::MAX_STARTUP_QUICK_CHECK_BYTES + 4096)
+            .unwrap();
+        assert!(
+            !DatabaseManager::should_run_startup_quick_check(&db_path),
+            "multi-GB databases above the startup quick_check budget must skip unconditional full-file scan"
+        );
     }
 
     #[tokio::test]
